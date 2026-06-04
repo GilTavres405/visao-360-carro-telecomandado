@@ -1,0 +1,838 @@
+// ESP32-CAM - Controlador WiFi (Sem Câmara)
+// Cria uma rede WiFi própria (Access Point) e serve uma página web de controlo.
+// Recebe comandos do browser e reencaminha para o Arduino via UART.
+// Autor: Gil Tavares
+// Data: 2026-05-26
+//
+// PINOS DE COMUNICAÇÃO (ESP32-CAM -> Arduino):
+//   GPIO14 -> TX (envia para o pino RX/2 do Arduino)
+//   GPIO16 <- RX (recebe do pino TX/3 do Arduino) [sem conflitos de boot]
+
+#include "soc/rtc_cntl_reg.h"
+#include "soc/soc.h"
+#include <WebServer.h>
+#include <WiFi.h>
+
+// ---- Configuração da rede WiFi (modo Access Point)
+const char *AP_SSID = "Carro Robotico"; // Nome da rede WiFi
+const char *AP_PASSWORD = "carro1234";  // Palavra-passe (mínimo 8 caracteres)
+
+// ---- UART para Arduino UNO ----
+HardwareSerial ArduinoSerial(1); // Usa UART1 do ESP32
+#define ESP_TX_PIN 14            // GPIO14 -> pino 2 do Arduino
+#define ESP_RX_PIN 16            // GPIO16 <- pino 3 do Arduino
+#define BAUD_ARDUINO 9600
+
+// Servidor Web
+WebServer server(80);
+
+// Variável de estado (para a página web)
+String ultimoComando = "Nenhum";
+String ultimaResposta = "---";
+
+// Página HTML do painel de controlo
+const char PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Comando PS2 - Carro Robótico 360°</title>
+    <style>
+        :root {
+            --bg-color: #0c0f13;
+            --controller-bg: #1c212a;
+            --button-bg: #2d3545;
+            --primary: #00d2ff;
+            --primary-glow: rgba(0, 210, 255, 0.4);
+            --green: #4caf50;
+            --red: #f44336;
+            --blue: #2196f3;
+            --pink: #e91e63;
+            --text-color: #ffffff;
+            --text-dim: #7f8fa4;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: radial-gradient(circle at center, #1b222d 0%, var(--bg-color) 100%);
+            color: var(--text-color);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            overflow-y: auto;
+            padding: 10px;
+        }
+
+        header {
+            text-align: center;
+            margin: 5px 0;
+        }
+
+        h1 {
+            font-size: 1.2rem;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            background: linear-gradient(45deg, var(--primary), #a800ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 800;
+        }
+
+        .status {
+            font-size: 0.7rem;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            margin-top: 2px;
+        }
+
+
+
+        /* Estrutura do Comando PS2 */
+        .ps2-controller {
+            width: 100%;
+            max-width: 600px;
+            background: var(--controller-bg);
+            border-radius: 40px;
+            border: 4px solid #141820;
+            padding: 15px;
+            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.7);
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            position: relative;
+        }
+
+        /* Botões de Ombro L1/L2/R1/R2 */
+        .shoulder-buttons {
+            display: flex;
+            justify-content: space-between;
+            width: 100%;
+            padding: 0 10px;
+        }
+
+        .shoulder-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .shoulder-btn {
+            background: var(--button-bg);
+            border: 1px solid #141820;
+            color: var(--text-color);
+            padding: 6px 15px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            border-radius: 6px;
+            cursor: pointer;
+            box-shadow: 0 3px 5px rgba(0,0,0,0.3);
+            text-transform: uppercase;
+        }
+
+        .shoulder-btn:active, .shoulder-btn.active {
+            background: var(--primary);
+            color: #000;
+            box-shadow: 0 0 10px var(--primary-glow);
+        }
+
+        /* Área Principal do Comando */
+        .main-controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            width: 100%;
+        }
+
+        /* D-Pad */
+        .dpad {
+            position: relative;
+            width: 130px;
+            height: 130px;
+            background: #13171e;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .dpad-btn {
+            position: absolute;
+            background: var(--button-bg);
+            border: none;
+            color: var(--text-color);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 6px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+
+        .dpad-btn svg {
+            width: 20px;
+            height: 20px;
+            fill: currentColor;
+        }
+
+        .dpad-btn:active, .dpad-btn.active {
+            background: var(--primary);
+            color: #000;
+            box-shadow: 0 0 10px var(--primary-glow);
+        }
+
+        .dpad-up { top: 8px; width: 36px; height: 42px; }
+        .dpad-down { bottom: 8px; width: 36px; height: 42px; }
+        .dpad-left { left: 8px; width: 42px; height: 36px; }
+        .dpad-right { right: 8px; width: 42px; height: 36px; }
+        .dpad-center { width: 32px; height: 32px; background: #13171e; border-radius: 50%; z-index: 2; }
+
+        /* Centro (Select/Start, Velocidades, LED) */
+        .center-console {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            flex-grow: 1;
+            padding: 0 10px;
+        }
+
+        .system-buttons {
+            display: flex;
+            gap: 10px;
+        }
+
+        .system-btn {
+            background: #13171e;
+            border: 1px solid #2d3545;
+            color: var(--text-dim);
+            font-size: 0.6rem;
+            padding: 4px 10px;
+            border-radius: 10px;
+            cursor: pointer;
+            text-transform: uppercase;
+            font-weight: bold;
+            box-shadow: inset 0 2px 4px rgba(0,0,0,0.5);
+        }
+
+        .system-btn:active, .system-btn.active {
+            background: var(--primary);
+            color: #000;
+        }
+
+        /* Seletor de Velocidade */
+        .speed-panel {
+            background: #13171e;
+            border-radius: 8px;
+            padding: 5px;
+            display: flex;
+            gap: 5px;
+            border: 1px solid rgba(255,255,255,0.05);
+        }
+
+        .speed-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-dim);
+            font-size: 0.65rem;
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .speed-btn.active {
+            background: var(--primary);
+            color: #000;
+            box-shadow: 0 0 8px var(--primary-glow);
+        }
+
+        /* Controlos Auxiliares (LED) */
+        .aux-panel {
+            display: flex;
+            gap: 10px;
+        }
+
+        .aux-btn {
+            background: #13171e;
+            border: 1px solid #2d3545;
+            color: var(--text-dim);
+            font-size: 0.6rem;
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .aux-btn.active {
+            background: var(--green);
+            color: #fff;
+            box-shadow: 0 0 8px rgba(76, 175, 80, 0.4);
+        }
+        
+        .aux-btn.danger.active {
+            background: var(--red);
+            color: #fff;
+            box-shadow: 0 0 8px rgba(244, 67, 54, 0.4);
+        }
+
+        /* Botões de Ação Geométricos */
+        .action-group {
+            position: relative;
+            width: 130px;
+            height: 130px;
+            background: #13171e;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .geo-btn {
+            position: absolute;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border: none;
+            background: var(--button-bg);
+            font-weight: 800;
+            font-size: 1.1rem;
+            cursor: pointer;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .geo-triangle { top: 8px; border: 2px solid var(--green); color: var(--green); }
+        .geo-triangle:active, .geo-triangle.active { background: var(--green); color: #000; box-shadow: 0 0 10px rgba(76, 175, 80, 0.5); }
+
+        .geo-circle { right: 8px; border: 2px solid var(--red); color: var(--red); }
+        .geo-circle:active, .geo-circle.active { background: var(--red); color: #fff; box-shadow: 0 0 10px rgba(244, 67, 54, 0.5); }
+
+        .geo-cross { bottom: 8px; border: 2px solid var(--blue); color: var(--blue); }
+        .geo-cross:active, .geo-cross.active { background: var(--blue); color: #fff; box-shadow: 0 0 10px rgba(33, 150, 243, 0.5); }
+
+        .geo-square { left: 8px; border: 2px solid var(--pink); color: var(--pink); }
+        .geo-square:active, .geo-square.active { background: var(--pink); color: #fff; box-shadow: 0 0 10px rgba(233, 30, 99, 0.5); }
+
+        /* Área dos Analógicos */
+        .joysticks-container {
+            display: flex;
+            justify-content: space-around;
+            width: 100%;
+            padding: 0 30px;
+            margin-top: 10px;
+        }
+
+        .joystick-wrapper {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .joystick-label {
+            font-size: 0.55rem;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .joystick-base {
+            width: 90px;
+            height: 90px;
+            background: radial-gradient(circle, #101319 0%, #080a0d 100%);
+            border-radius: 50%;
+            border: 2px solid #2d3545;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            touch-action: none;
+            box-shadow: inset 0 4px 10px rgba(0,0,0,0.8);
+        }
+
+        .joystick-stick {
+            width: 44px;
+            height: 44px;
+            background: radial-gradient(circle, #3d475c 0%, #1e2430 100%);
+            border-radius: 50%;
+            position: absolute;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.5), inset 0 2px 2px rgba(255,255,255,0.1);
+            cursor: pointer;
+            transition: transform 0.05s ease;
+        }
+
+        /* Consola de Estado */
+        .console-log {
+            width: 100%;
+            max-width: 600px;
+            background: rgba(0,0,0,0.4);
+            border-radius: 8px;
+            padding: 8px;
+            margin-top: 10px;
+            font-family: monospace;
+            font-size: 0.65rem;
+            color: var(--primary);
+            border: 1px solid rgba(0, 210, 255, 0.1);
+            display: flex;
+            justify-content: space-between;
+        }
+
+        footer {
+            margin: 15px 0 5px;
+            font-size: 0.6rem;
+            color: var(--text-dim);
+        }
+
+        @media (max-width: 480px) {
+            .ps2-controller {
+                padding: 10px;
+                border-radius: 25px;
+            }
+            .dpad, .action-group {
+                width: 110px;
+                height: 110px;
+            }
+            .dpad-up { top: 6px; width: 32px; height: 38px; }
+            .dpad-down { bottom: 6px; width: 32px; height: 38px; }
+            .dpad-left { left: 6px; width: 38px; height: 32px; }
+            .dpad-right { right: 6px; width: 38px; height: 32px; }
+            
+            .geo-btn { width: 32px; height: 32px; font-size: 0.95rem; }
+            .geo-triangle { top: 6px; }
+            .geo-circle { right: 6px; }
+            .geo-cross { bottom: 6px; }
+            .geo-square { left: 6px; }
+
+            .joystick-base {
+                width: 80px;
+                height: 80px;
+            }
+            .joystick-stick {
+                width: 38px;
+                height: 38px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Controlo Visão 360°</h1>
+        <div class="status">Ligação Wi-Fi Estabelecida</div>
+    </header>
+
+
+
+    <!-- Comando Virtual PS2 -->
+    <div class="ps2-controller">
+        <!-- L1/L2 e R1/R2 -->
+        <div class="shoulder-buttons">
+            <div class="shoulder-group">
+                <button class="shoulder-btn" data-cmd="LENTO" id="btn-l1">L1</button>
+                <button class="shoulder-btn" data-cmd="LED_ON" id="btn-l2">L2</button>
+            </div>
+            <div class="shoulder-group">
+                <button class="shoulder-btn" data-cmd="TURBO" id="btn-r1">R1</button>
+                <button class="shoulder-btn" data-cmd="LED_OFF" id="btn-r2">R2</button>
+            </div>
+        </div>
+
+        <!-- Dpad, Consola Central, Ação -->
+        <div class="main-controls">
+            <!-- D-Pad -->
+            <div class="dpad">
+                <button class="dpad-btn dpad-up" data-cmd="FRENTE">
+                    <svg viewBox="0 0 24 24"><path d="M7 14l5-5 5 5z"/></svg>
+                </button>
+                <button class="dpad-btn dpad-left" data-cmd="ESQ">
+                    <svg viewBox="0 0 24 24"><path d="M14 17l-5-5 5-5z"/></svg>
+                </button>
+                <div class="dpad-center"></div>
+                <button class="dpad-btn dpad-right" data-cmd="DIR">
+                    <svg viewBox="0 0 24 24"><path d="M10 17l5-5-5-5z"/></svg>
+                </button>
+                <button class="dpad-btn dpad-down" data-cmd="TRAS">
+                    <svg viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg>
+                </button>
+            </div>
+
+            <!-- Consola Central -->
+            <div class="center-console">
+                <div class="system-buttons">
+                    <button class="system-btn" data-cmd="NORMAL" id="btn-select">Select</button>
+                    <button class="system-btn danger" data-cmd="PARE" id="btn-start">Start (PARE)</button>
+                </div>
+
+                <!-- Painel Seletor de Velocidades -->
+                <div class="speed-panel">
+                    <button class="speed-btn" id="lbl-lento" onclick="definirVelocidade('LENTO')">Lento</button>
+                    <button class="speed-btn active" id="lbl-normal" onclick="definirVelocidade('NORMAL')">Normal</button>
+                    <button class="speed-btn" id="lbl-turbo" onclick="definirVelocidade('TURBO')">Turbo</button>
+                </div>
+
+                <!-- Controlos Rápidos LED -->
+                <div class="aux-panel">
+                    <button class="aux-btn" id="lbl-ledon" onclick="controlarLED('LED_ON')">LED ON</button>
+                    <button class="aux-btn danger active" id="lbl-ledoff" onclick="controlarLED('LED_OFF')">LED OFF</button>
+                </div>
+            </div>
+
+            <!-- Botões de Ação Geométricos -->
+            <div class="action-group">
+                <button class="geo-btn geo-triangle" data-cmd="BASE_ESQ">▲</button>
+                <button class="geo-btn geo-square" data-cmd="GARRA_FECHA">■</button>
+                <button class="geo-btn geo-circle" data-cmd="GARRA_ABRE">●</button>
+                <button class="geo-btn geo-cross" data-cmd="BASE_DIR">✖</button>
+            </div>
+        </div>
+
+        <!-- Joysticks Analógicos -->
+        <div class="joysticks-container">
+            <div class="joystick-wrapper">
+                <span class="joystick-label">L3 (Motores)</span>
+                <div class="joystick-base" id="joy-left">
+                    <div class="joystick-stick" id="stick-left"></div>
+                </div>
+            </div>
+            <div class="joystick-wrapper">
+                <span class="joystick-label">R3 (Servos)</span>
+                <div class="joystick-base" id="joy-right">
+                    <div class="joystick-stick" id="stick-right"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Logger de Estado de Comunicação -->
+    <div class="console-log">
+        <span>Último: <strong id="lbl-cmd">PARE</strong></span>
+        <span>Resposta: <strong id="lbl-res">---</strong></span>
+    </div>
+
+    <footer>
+        <p>Gil Tavares &copy; 2026 - PAP Projeto Visão 360</p>
+    </footer>
+
+    <script>
+        let currentCommand = null;
+        let heartbeatInterval = null;
+        const heartbeatRate = 350; // Milissegundos
+
+
+
+        // Retorna o comando de paragem adequado (PARE para motores, nada para servos pois não incrementam mais)
+        function getStopCommand(cmd) {
+            if (['FRENTE', 'TRAS', 'ESQ', 'DIR'].includes(cmd)) return 'PARE';
+            return null; 
+        }
+
+        function sendCommand(cmd, quiet = false) {
+            fetch(`/cmd?v=${cmd}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.ok) {
+                        document.getElementById('lbl-cmd').innerText = data.cmd;
+                        document.getElementById('lbl-res').innerText = data.resposta;
+                        
+                        // Atualiza botões ativos com base nos comandos recebidos
+                        if (['TURBO', 'NORMAL', 'LENTO'].includes(data.cmd)) {
+                            atualizarUIVelocidade(data.cmd);
+                        }
+                        if (['LED_ON', 'LED_OFF'].includes(data.cmd)) {
+                            atualizarUILED(data.cmd);
+                        }
+                    }
+                })
+                .catch(err => console.error("Falha ao comunicar com a ESP32:", err));
+        }
+
+        function startCommand(cmd) {
+            if (currentCommand === cmd) return;
+            stopCurrentCommand();
+
+            currentCommand = cmd;
+            sendCommand(cmd);
+
+            // Heartbeat ativo enquanto pressionado
+            heartbeatInterval = setInterval(() => {
+                if (currentCommand) {
+                    sendCommand(currentCommand, true);
+                }
+            }, heartbeatRate);
+        }
+
+        function stopCurrentCommand() {
+            if (heartbeatInterval) {
+                clearInterval(heartbeatInterval);
+                heartbeatInterval = null;
+            }
+            if (currentCommand) {
+                const stopCmd = getStopCommand(currentCommand);
+                if (stopCmd) {
+                    sendCommand(stopCmd);
+                }
+                currentCommand = null;
+            }
+        }
+
+        // Funções da Consola Central
+        function definirVelocidade(modo) {
+            sendCommand(modo);
+        }
+
+        function controlarLED(estado) {
+            sendCommand(estado);
+        }
+
+        function atualizarUIVelocidade(modo) {
+            document.getElementById('lbl-lento').classList.remove('active');
+            document.getElementById('lbl-normal').classList.remove('active');
+            document.getElementById('lbl-turbo').classList.remove('active');
+            
+            if (modo === 'LENTO') document.getElementById('lbl-lento').classList.add('active');
+            if (modo === 'NORMAL') document.getElementById('lbl-normal').classList.add('active');
+            if (modo === 'TURBO') document.getElementById('lbl-turbo').classList.add('active');
+        }
+
+        function atualizarUILED(estado) {
+            document.getElementById('lbl-ledon').classList.remove('active');
+            document.getElementById('lbl-ledoff').classList.remove('active');
+            
+            if (estado === 'LED_ON') document.getElementById('lbl-ledon').classList.add('active');
+            if (estado === 'LED_OFF') document.getElementById('lbl-ledoff').classList.add('active');
+        }
+
+        // Registo de eventos de botões
+        const buttons = document.querySelectorAll('.dpad-btn, .geo-btn, .shoulder-btn, .system-btn');
+        buttons.forEach(btn => {
+            const cmd = btn.getAttribute('data-cmd');
+            
+            // Toque (Mobile)
+            btn.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                btn.classList.add('active');
+                startCommand(cmd);
+            }, { passive: false });
+
+            btn.addEventListener('touchend', (e) => {
+                e.preventDefault();
+                btn.classList.remove('active');
+                if (currentCommand === cmd) {
+                    stopCurrentCommand();
+                }
+            }, { passive: false });
+
+            // Rato (PC)
+            btn.addEventListener('mousedown', () => {
+                btn.classList.add('active');
+                startCommand(cmd);
+            });
+
+            btn.addEventListener('mouseup', () => {
+                btn.classList.remove('active');
+                if (currentCommand === cmd) {
+                    stopCurrentCommand();
+                }
+            });
+
+            btn.addEventListener('mouseleave', () => {
+                if (btn.classList.contains('active')) {
+                    btn.classList.remove('active');
+                    if (currentCommand === cmd) {
+                        stopCurrentCommand();
+                    }
+                }
+            });
+        });
+
+        // Joysticks Analógicos Draggables
+        setupJoystick('joy-left', 'stick-left', (x, y) => {
+            // Analógico Esquerdo: Controlo de Movimento
+            if (y < -0.5) startCommand('FRENTE');
+            else if (y > 0.5) startCommand('TRAS');
+            else if (x < -0.5) startCommand('ESQ');
+            else if (x > 0.5) startCommand('DIR');
+            else stopCurrentCommand();
+        });
+
+        setupJoystick('joy-right', 'stick-right', (x, y) => {
+            // Analógico Direito: Controlo de Articulação (Servos)
+            if (x < -0.4) startCommand('BASE_ESQ');
+            else if (x > 0.4) startCommand('BASE_DIR');
+            else if (y < -0.4) startCommand('GARRA_ABRE');
+            else if (y > 0.4) startCommand('GARRA_FECHA');
+            else stopCurrentCommand();
+        });
+
+        function setupJoystick(baseId, stickId, callback) {
+            const base = document.getElementById(baseId);
+            const stick = document.getElementById(stickId);
+            let dragging = false;
+            let startX, startY;
+            const maxDistance = 30; // Distância máxima em pixels
+
+            function handleStart(clientX, clientY) {
+                dragging = true;
+                const rect = base.getBoundingClientRect();
+                startX = rect.left + rect.width / 2;
+                startY = rect.top + rect.height / 2;
+            }
+
+            function handleMove(clientX, clientY) {
+                if (!dragging) return;
+                let dx = clientX - startX;
+                let dy = clientY - startY;
+                const distance = Math.sqrt(dx*dx + dy*dy);
+
+                if (distance > maxDistance) {
+                    dx = (dx / distance) * maxDistance;
+                    dy = (dy / distance) * maxDistance;
+                }
+
+                stick.style.transform = `translate(${dx}px, ${dy}px)`;
+                
+                // Normaliza valores entre -1 e 1
+                callback(dx / maxDistance, dy / maxDistance);
+            }
+
+            function handleEnd() {
+                if (!dragging) return;
+                dragging = false;
+                stick.style.transform = 'translate(0px, 0px)';
+                callback(0, 0);
+            }
+
+            // Eventos Tácteis
+            base.addEventListener('touchstart', e => {
+                e.preventDefault();
+                handleStart(e.touches[0].clientX, e.touches[0].clientY);
+            }, { passive: false });
+
+            window.addEventListener('touchmove', e => {
+                if (dragging) {
+                    handleMove(e.touches[0].clientX, e.touches[0].clientY);
+                }
+            }, { passive: false });
+
+            window.addEventListener('touchend', handleEnd);
+
+            // Eventos de Rato
+            base.addEventListener('mousedown', e => {
+                handleStart(e.clientX, e.clientY);
+            });
+
+            window.addEventListener('mousemove', e => {
+                if (dragging) {
+                    handleMove(e.clientX, e.clientY);
+                }
+            });
+
+            window.addEventListener('mouseup', handleEnd);
+        }
+
+        // Libertação global de segurança
+        window.addEventListener('mouseup', () => {
+            buttons.forEach(btn => btn.classList.remove('active'));
+            stopCurrentCommand();
+        });
+
+        window.addEventListener('touchend', () => {
+            buttons.forEach(btn => btn.classList.remove('active'));
+            stopCurrentCommand();
+        });
+    </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() { server.send_P(200, "text/html", PAGE); }
+
+void handleCmd() {
+  if (!server.hasArg("v")) {
+    server.send(400, "application/json", "{\"erro\":\"sem argumento\"}");
+    return;
+  }
+
+  ultimoComando = server.arg("v");
+  String mensagem = ultimoComando +
+                    "\n"; // Envia apenas o comando cru esperado pelo Arduino R3
+
+  ArduinoSerial.print(mensagem);
+  Serial.print("[-> Arduino] ");
+  Serial.print(mensagem);
+
+  // Responde imediatamente ao browser para evitar lag
+  server.send(200, "application/json",
+              "{\"ok\":true,\"cmd\":\"" + ultimoComando + "\",\"resposta\":\"" +
+                  ultimaResposta + "\"}");
+}
+
+void handleStatus() {
+  String json = "{\"ultimoComando\":\"" + ultimoComando +
+                "\",\"ultimaResposta\":\"" + ultimaResposta + "\"}";
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  // Desativa o detetor de brownout para prevenir reboots por queda ligeira de
+  // tensão
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println(F("=== ESP32-CAM a iniciar (Sem Câmara) ==="));
+
+  // Inicia UART com Arduino
+  ArduinoSerial.begin(BAUD_ARDUINO, SERIAL_8N1, ESP_RX_PIN, ESP_TX_PIN);
+  ArduinoSerial.setTimeout(50);
+  Serial.print(F("UART Arduino: TX=GPIO"));
+  Serial.print(ESP_TX_PIN);
+  Serial.print(F(" RX=GPIO"));
+  Serial.println(ESP_RX_PIN);
+
+  // Cria rede WiFi própria
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print(F("Rede WiFi Criada: "));
+  Serial.println(AP_SSID);
+  Serial.print(F("IP do Painel de Controlo: http://"));
+  Serial.println(ip);
+
+  // Regista rotas HTTP
+  server.on("/", handleRoot);
+  server.on("/cmd", handleCmd);
+  server.on("/status", handleStatus);
+  server.begin();
+
+  Serial.println(F("Servidor HTTP pronto!"));
+}
+
+void loop() {
+  server.handleClient();
+
+  // Lê mensagens espontâneas enviadas pelo Arduino (para fins de debug)
+  while (ArduinoSerial.available()) {
+    String msg = ArduinoSerial.readStringUntil('\n');
+    msg.trim();
+    if (msg.length() > 0) {
+      Serial.print(F("[Arduino] "));
+      Serial.println(msg);
+      ultimaResposta = msg;
+    }
+  }
+}
